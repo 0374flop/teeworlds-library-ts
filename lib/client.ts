@@ -100,7 +100,14 @@ export class Client extends EventEmitter {
 	private port: number;
 	private name: string;
 	private _State: number; // 0 = offline; 1 = STATE_CONNECTING = 1, STATE_LOADING = 2, STATE_ONLINE = 3
+	
+	// this is the last chunk sequence the CLIENT has received from the server 269
 	private ack: number;
+	
+	// this is the last sequence the server has acknowledged
+	private lastAcknowledgedSequence: number = 0; 
+	
+	// this is the last chunk sequence the CLIENT has sent to the server 266
 	private clientAck: number;
 	private lastCheckedChunkAck: number;
 	private receivedSnaps: number; /* wait for 2 ss before seeing self as connected */
@@ -120,6 +127,7 @@ export class Client extends EventEmitter {
 
 	private snaps: Buffer[];
 
+	// TODO: why does this and lastSentMessages exist simultaneously???
 	private sentChunkQueue: Buffer[];
 	private queueChunkEx: MsgPacker[];
 	private lastSendTime: number;
@@ -491,7 +499,8 @@ export class Client extends EventEmitter {
 		return chunk;
 	}
 	Flush() {
-		// if (this.queueChunkEx.length == 0)
+		// TODO: should probably not be possible to flush if no chunks in queue & no flags set?
+		// if (this.queueChunkEx.length == 0) 
 		this.SendMsgEx(this.queueChunkEx);
 		this.queueChunkEx = [];
 		this.ack = this.lastCheckedChunkAck;
@@ -556,7 +565,7 @@ export class Client extends EventEmitter {
 		this.resendTimeout = setInterval(() => {
 			if (this._State != States.STATE_OFFLINE) {
 				if (((new Date().getTime()) - this.lastSendTime) > 900 && this.sentChunkQueue.length > 0) {
-					this.SendMsgRaw([this.sentChunkQueue[0]]);
+					this.SendMsgRaw(this.sentChunkQueue); // resends all chunks that have not been acked by the server yet
 				}
 			}
 		}, 1000)
@@ -627,15 +636,23 @@ export class Client extends EventEmitter {
 				}
 
 				var unpacked: _Packet = this.Unpack(packet);
+				if (unpacked.twprotocol.flags & 2)
+					return; // ignore connless packets for now
+				this.lastAcknowledgedSequence = unpacked.twprotocol.ack;
+
 				// unpacked.chunks = unpacked.chunks.filter(chunk => ((chunk.flags & 2) && (chunk.flags & 1)) ? chunk.seq! > this.ack : true); // filter out already received chunks
-				this.sentChunkQueue.forEach((buff, i) => {
+				for (let i = this.sentChunkQueue.length - 1; i >= 0; i--) {
+				// iterate from behind so we dont have to care about "skipping" indices
+					let buff = this.sentChunkQueue[i];
 					let chunkFlags = (buff[0] >> 6) & 3;
 					if (chunkFlags & 1) {
 						let chunk = this.MsgToChunk(buff);
-						if (chunk.seq && chunk.seq >= this.ack)
+						if (chunk.seq && chunk.seq <= this.lastAcknowledgedSequence) {
+							// console.log("splicing", this.sentChunkQueue.length, chunk.seq, this.ack, this.lastAcknowledgedSequence);
 							this.sentChunkQueue.splice(i, 1);
+						}
 					}
-				})
+				}
 				unpacked.chunks.forEach(chunk => {
 					if (!(((chunk.flags & 2) && (chunk.flags & 1)) ? chunk.seq! > this.ack : true))
 						return; // filter out already received chunks
