@@ -353,7 +353,7 @@ export class Client extends EventEmitter {
 		return unpacked
 	}
 
-
+	// TODO: CONTROL MESSAGES ARE NOT BEING RESENT AUTOMATICALLY YET
 	/**  Send a Control Msg to the server. (used for disconnect)*/
 	SendControlMsg(msg: number, ExtraMsg: string = "") {
 		this.lastSendTime = new Date().getTime();
