@@ -20,6 +20,7 @@ import { SnapshotWrapper } from "./components/snapshot";
 import { UUIDManager } from "./UUIDManager";
 import { NETMSG, States } from "./enums_types/protocol";
 import { Rcon } from "./components/rcon";
+import { TwMap } from "./components/twmap";
 
 const huff = new Huffman();
 
@@ -60,6 +61,14 @@ declare interface iMapChange {
 	size: number
 }
 
+export interface iMapDetails {
+	map_name: string,
+	map_sha256: Buffer,
+	map_crc: number,
+	map_size: number,
+	map_url: string
+}
+
 declare interface iOptions {
 	identity?: SnapshotItemTypes.ClientInfo,
 	password?: string,
@@ -68,6 +77,7 @@ declare interface iOptions {
 	NET_VERSION?: string,
 	lightweight?: boolean, // experimental, only sends keepalive's (sendinput has to be called manually)
 	timeout_on_connecting?: boolean, // don't reconnect if timeout occurs when establishing connection
+	downloadMap?: boolean
 }
 
 interface ClientEvents {
@@ -81,7 +91,7 @@ interface ClientEvents {
     motd: (message: string) => void;
     teams: (teams: Array<number>) => void;
 	teamkill: (teamkill: iKillMsgTeam) => void;
-    map_details: (message: { map_name: string, map_sha256: Buffer, map_crc: number, map_size: number, map_url: string }) => void;
+    map_details: (message: iMapDetails) => void;
     capabilities: (message: { ChatTimeoutCode: boolean, AnyPlayerFlag: boolean, PingEx: boolean, AllowDummy: boolean, SyncWeaponInput: boolean }) => void;
     snapshot: (items: DeltaItem[]) => void;
 }
@@ -139,6 +149,9 @@ export class Client extends EventEmitter {
 	public movement: Movement;
 	public game: Game;
 
+	public map: TwMap | undefined;
+	private lastMapDetails: iMapDetails | undefined;
+
 	private VoteList: string[];
 	// eSnapHolder: eSnap[];
 
@@ -163,6 +176,8 @@ export class Client extends EventEmitter {
 		this.AckGameTick = 0;
 		this.PredGameTick = 0;
 		this.currentSnapshotGameTick = 0;
+
+		this.map = undefined;
 
 		this.SnapshotParts = 0;
 		this.rcon = new Rcon(this);
@@ -638,6 +653,9 @@ export class Client extends EventEmitter {
 				var unpacked: _Packet = this.Unpack(packet);
 				if (unpacked.twprotocol.flags & 2)
 					return; // ignore connless packets for now
+
+				// if the packets are ordered wrong from our opposite person then we might think they are further behind than they actually are..
+				// should (?) not be a problem because we clear the sentchunkqueue instantly afterwards anyways.
 				this.lastAcknowledgedSequence = unpacked.twprotocol.ack;
 
 				// unpacked.chunks = unpacked.chunks.filter(chunk => ((chunk.flags & 2) && (chunk.flags & 1)) ? chunk.seq! > this.ack : true); // filter out already received chunks
@@ -693,13 +711,114 @@ export class Client extends EventEmitter {
 						if (chunk.msgid == NETMSG.System.NETMSG_MAP_CHANGE) {
 							let unpacker = new MsgUnpacker(chunk.raw);
 							const map_name = unpacker.unpackString();
-							const crc = unpacker.unpackInt();
+							const wantedCrc = unpacker.unpackInt();
 							const size = unpacker.unpackInt();
 
-							this.emit("map_change", {map_name, crc, size} as iMapChange);
+							this.emit("map_change", {map_name, crc: wantedCrc, size} as iMapChange);
 							this.Flush();
-							var Msg = new MsgPacker(NETMSG.System.NETMSG_READY, true, 1); /* ready */
-							this.SendMsgEx(Msg);
+							
+							if (!this.options?.downloadMap) {
+								var MsgReady = new MsgPacker(NETMSG.System.NETMSG_READY, true, 1); /* ready */
+								
+								this.SendMsgEx(MsgReady);
+							} else {
+								if (size < 0 || size > 1024 * 1024 * 1024) {
+									return;
+								}
+								if (map_name.includes("/") || map_name.includes("\\")) {
+									return;
+								}
+								var MsgRequestMap = new MsgPacker(NETMSG.System.NETMSG_REQUEST_MAP_DATA, true, 1);
+								
+								this.map = new TwMap(map_name, wantedCrc, size);
+								if (wantedCrc == this.lastMapDetails?.map_crc && map_name == this.lastMapDetails.map_name && size == this.lastMapDetails.map_size) {
+									// if (this.lastMapDetails.map_url != "")
+									this.map.map_details = { ...this.lastMapDetails }; 
+									// try http
+									console.log("map", this.map.map_details.map_url)
+									fetch(this.map.map_details.map_url)
+									.then((res) => {
+										console.log("map1", this.map?.map_details?.map_url)
+										if (res.ok)
+												return res.arrayBuffer();
+											throw new Error("received bad response from http url");		
+										})
+											.then((data) => {
+												if (this.map == undefined)
+													return;
+												console.log("map2", this.map?.map_details?.map_url);
+
+												if (data == undefined)
+													throw new Error("invalid http map response");
+													
+												this.map?.appendChunk(0, Buffer.from(data));
+												console.log(this.map.mapBuffer.byteLength, this.map.calculateCrc()&0xffffffff, wantedCrc & 0xffffffff, wantedCrc);
+												// console.log("sha256", this.lastMapDetails?.map_sha256.compare(this.map.calculateSha256().digest()));
+												if (this.map.calculateCrc() != wantedCrc) {
+													// crc mismatch, fallback to tw protocol
+													console.log("crc mismatch");
+													this.map = new TwMap(map_name, wantedCrc, size);
+													MsgRequestMap.AddInt(this.map.current_downloading_chunk);
+													this.SendMsgEx(MsgRequestMap);
+
+												} else {
+													var MsgReady = new MsgPacker(NETMSG.System.NETMSG_READY, true, 1); /* ready */
+													this.map.downloading = false;	
+													this.SendMsgEx(MsgReady);
+												}
+
+
+											})
+										.catch(() => {
+											console.log("map3", this.map?.map_details?.map_url)
+
+											if (this.map == undefined)
+												return;
+											// http failed, fallback to tw protocol
+											MsgRequestMap.AddInt(this.map.current_downloading_chunk);
+											this.SendMsgEx(MsgRequestMap);
+										})
+								} else {
+									// no map details received, get map via tw protocol
+									MsgRequestMap.AddInt(this.map.current_downloading_chunk);
+									this.SendMsgEx(MsgRequestMap);
+								}
+							}
+							
+						} else if (chunk.msgid == NETMSG.System.NETMSG_MAP_DATA) {
+							if (this.map == undefined || !this.map.downloading)
+								return;
+							
+							let unpacker = new MsgUnpacker(chunk.raw);
+							const last = unpacker.unpackInt();
+							const crc = unpacker.unpackInt();
+							const mapChunkIndex = unpacker.unpackInt();
+							const mapChunkSize = unpacker.unpackInt();
+							const mapChunkData = unpacker.unpackRaw(mapChunkSize);
+							
+							this.map.appendChunk(mapChunkIndex, mapChunkData);
+							
+							if (!last) {
+								var MsgRequestMap = new MsgPacker(NETMSG.System.NETMSG_REQUEST_MAP_DATA, true, 1);
+								if (mapChunkIndex == this.map.current_downloading_chunk) {
+									this.map.current_downloading_chunk++;
+									MsgRequestMap.AddInt(this.map.current_downloading_chunk);
+								}
+								this.SendMsgEx(MsgRequestMap);
+							} else {
+								console.log(this.map.mapBuffer.byteLength, this.map.calculateCrc(), crc & 0xffffffff, crc);
+								
+								// TODO: will likely throw if the "last" packet arrives before one of the data packets. not sure if we make sure to parse the chunks in order
+								if (this.map.calculateCrc() != crc) {
+									throw new Error(`crc mismatch while downloading map: expected ${crc}, received ${this.map.calculateCrc()}`);
+								}
+
+
+								var MsgReady = new MsgPacker(NETMSG.System.NETMSG_READY, true, 1); /* ready */
+								this.map.downloading = false;	
+								this.SendMsgEx(MsgReady);
+							}
+							
 						} else if (chunk.msgid == NETMSG.System.NETMSG_CON_READY) {
 							var info = new MsgPacker(NETMSG.Game.CL_STARTINFO, false, 1);
 							if (this.options?.identity) {
@@ -815,7 +934,7 @@ export class Client extends EventEmitter {
 								this.QueueChunkEx(packer)
 							}
 
-							if (chunk.msgid == NETMSG.System.NETMSG_MAP_DETAILS) { // TODO: option for downloading maps
+							if (chunk.msgid == NETMSG.System.NETMSG_MAP_DETAILS) {
 								let unpacker = new MsgUnpacker(chunk.raw);
 
 								let map_name = unpacker.unpackString();
@@ -829,8 +948,8 @@ export class Client extends EventEmitter {
 								if (unpacker.remaining.length)
 									map_url = unpacker.unpackString();
 
-								this.emit("map_details", {map_name, map_sha256, map_crc, map_size, map_url})
-								// unpacker.unpack
+								this.lastMapDetails = {map_name, map_sha256, map_crc, map_size, map_url};
+								this.emit("map_details", {...this.lastMapDetails});
 
 							} else if (chunk.msgid == NETMSG.System.NETMSG_CAPABILITIES) {
 								let unpacker = new MsgUnpacker(chunk.raw);
