@@ -735,10 +735,8 @@ export class Client extends EventEmitter {
 									// if (this.lastMapDetails.map_url != "")
 									this.map.map_details = { ...this.lastMapDetails }; 
 									// try http
-									console.log("map", this.map.map_details.map_url)
 									fetch(this.map.map_details.map_url)
 									.then((res) => {
-										console.log("map1", this.map?.map_details?.map_url)
 										if (res.ok)
 												return res.arrayBuffer();
 											throw new Error("received bad response from http url");		
@@ -746,31 +744,30 @@ export class Client extends EventEmitter {
 											.then((data) => {
 												if (this.map == undefined)
 													return;
-												console.log("map2", this.map?.map_details?.map_url);
 
 												if (data == undefined)
 													throw new Error("invalid http map response");
 													
 												this.map?.appendChunk(0, Buffer.from(data));
-												console.log(this.map.mapBuffer.byteLength, this.map.calculateCrc()&0xffffffff, wantedCrc & 0xffffffff, wantedCrc);
 												// console.log("sha256", this.lastMapDetails?.map_sha256.compare(this.map.calculateSha256().digest()));
 												if (this.map.calculateCrc() != wantedCrc) {
 													// crc mismatch, fallback to tw protocol
-													console.log("crc mismatch");
 													this.map = new TwMap(map_name, wantedCrc, size);
 													MsgRequestMap.AddInt(this.map.current_downloading_chunk);
 													this.SendMsgEx(MsgRequestMap);
 
 												} else {
 													var MsgReady = new MsgPacker(NETMSG.System.NETMSG_READY, true, 1); /* ready */
-													this.map.downloading = false;	
+													this.map.downloading = false;
+													this.map.parseMap();
+	
 													this.SendMsgEx(MsgReady);
 												}
 
 
 											})
 										.catch(() => {
-											console.log("map3", this.map?.map_details?.map_url)
+											// console.log("map3", this.map?.map_details?.map_url)
 
 											if (this.map == undefined)
 												return;
@@ -806,16 +803,16 @@ export class Client extends EventEmitter {
 								}
 								this.SendMsgEx(MsgRequestMap);
 							} else {
-								console.log(this.map.mapBuffer.byteLength, this.map.calculateCrc(), crc & 0xffffffff, crc);
 								
 								// TODO: will likely throw if the "last" packet arrives before one of the data packets. not sure if we make sure to parse the chunks in order
 								if (this.map.calculateCrc() != crc) {
 									throw new Error(`crc mismatch while downloading map: expected ${crc}, received ${this.map.calculateCrc()}`);
 								}
 
+								this.map.downloading = false;	
+								this.map.parseMap();
 
 								var MsgReady = new MsgPacker(NETMSG.System.NETMSG_READY, true, 1); /* ready */
-								this.map.downloading = false;	
 								this.SendMsgEx(MsgReady);
 							}
 							
